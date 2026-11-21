@@ -6,7 +6,7 @@
 
 **Swipe on what to watch next, alone or with a group.**
 
-`MIT` · `Next` · `SQLite` · `v2.0.0` · `ghcr.io/jakobbjelver/messer-swipe`
+`MIT` · `Next` · `SQLite` · `v2.3.0` · `ghcr.io/jakobbjelver/messer-swipe`
 <!-- /messer:hero -->
 
 Swipe turns "what should we watch?" into a deck everyone can agree on. One person creates a session, the
