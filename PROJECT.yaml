@@ -28,10 +28,14 @@ deploy:
   kind: "docker"
   image: "ghcr.io/jakobbjelver/messer-swipe"
   domain: "swipe.messer.wtf"      # the public demo; APP_PUBLIC_URL's default
+  dev_domain: "dev-server.messer.wtf"
 
 dev:
   command: "npm run dev"
+  runner: "~/Scripts/run-messer-swipe-dev.sh"
   ports: [3000]
+  pm2: "messer-swipe-dev"
+  slot: "legacy-3000"
 
 visibility: "public"
 contributions: "closed"           # no pull requests
