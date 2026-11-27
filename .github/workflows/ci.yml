@@ -1,7 +1,17 @@
 name: tests
 
-# One workflow for the repo's own gates. Named `tests` with a `unit` job on purpose: that is the
-# required check branch protection and the Dependabot auto-merge already wait for.
+# The repo's own gates — and now the only workflow that runs them.
+#
+# GitHub bills each *job* rounded up to a whole minute, so a 12-second job costs the same
+# as a 59-second one. Three consequences shaped this file:
+#   * the UI conformance pass (its own workflow before) is two steps inside `unit` now,
+#     where the checkout and node install are already paid for;
+#   * `unit` and `verify` were the same job twice — one `npm ci`, then test, typecheck, lint;
+#   * the two e2e suites share one build. `npm run build` was the most expensive step in
+#     either of them and it was being paid for twice.
+#
+# The job id `unit` is load-bearing: it is the required check branch protection and the
+# Dependabot auto-merge wait for. Do not rename it.
 on:
   push:
     branches: [master, develop, dev]
@@ -23,23 +33,27 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
-
-  verify:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-      - run: npm ci
       - run: npm run typecheck
       - run: npm run lint
 
-  # The gate that unit tests cannot be: the fixture-driven UI contract on a real
-  # server. It needs no provider — the media API is answered from fixtures — so it
-  # catches "the deck renders nothing" and "the switch lost its paper knob" on every
-  # push instead of on a user's phone.
+      # messer-ui conformance, source pass: colours, radii, icon set, type scale and fonts.
+      # No browser, no running app. (The full pass — `npm run messer` against a served
+      # /ui sink — still runs before a release, not here.)
+      - uses: actions/checkout@v4
+        with:
+          repository: jakobbjelver/messer-ui
+          path: .messer-ui
+      - name: messer check (static)
+        run: node .messer-ui/scripts/check.mjs --app . --static
+      # `check` cannot see a stale block copy; this compares every installed block against
+      # registry/<item> (a deliberate divergence is declared in apps.json).
+      - name: installed blocks match the registry
+        run: node .messer-ui/scripts/blocks.mjs --app .
+
+  # The gates that unit tests cannot be, against a real server with a fixture provider
+  # (no TMDB key): the UI contract and the deck behaviour, then a full group session —
+  # create → join → match → takeover → persistence — driven by two real browsers.
+  # One build, two servers, run in sequence: they share nothing but the artefact.
   e2e:
     runs-on: ubuntu-latest
     env:
@@ -61,9 +75,14 @@ jobs:
       # rather than the lockfile, so `npm ci` stays the only install the app needs.
       - run: npm install --no-save playwright
       - run: npx playwright install --with-deps chromium
-      - name: Start the app
+      # session.mjs reads the durable match count with the sqlite3 CLI; do not weaken that
+      # to a route the app serves, which is what the check exists to avoid trusting.
+      - run: sudo apt-get update && sudo apt-get install -y sqlite3
+
+      - name: Start the app (contract fixtures)
         run: |
           npx next start -p 3100 &
+          echo $! > /tmp/app-3100.pid
           for i in $(seq 1 90); do
             if curl -sf http://127.0.0.1:3100/api/health >/dev/null; then echo "up after ${i}s"; exit 0; fi
             sleep 1
@@ -72,48 +91,22 @@ jobs:
       - run: node e2e/contract.mjs
         env:
           E2E_BASE_URL: "http://127.0.0.1:3100"
-      # The same server, the behaviour contract: the keys the guide prints, the hint row they
-      # raise, and the spoiler mask. Separate file so a layout failure and a behaviour failure
-      # stay distinguishable in the run list.
+      # The same server, the behaviour contract: the keys the guide prints, the hint row
+      # they raise, and the spoiler mask. Separate file so a layout failure and a behaviour
+      # failure stay distinguishable in the run list.
       - run: node e2e/deck.mjs
         env:
           E2E_BASE_URL: "http://127.0.0.1:3100"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: e2e-shots
-          path: e2e/shots
-          retention-days: 7
-          if-no-files-found: ignore
 
-  # A group session, driven by two real browsers: create → join → match → takeover →
-  # persistence. It needs its own server and its own database (the fixtures are the same, but
-  # `session.mjs` reads the match rows out of SQLite directly), and TMDB mode is what makes it
-  # cheap — a display name is a fresh identity, no second Jellyfin account.
-  e2e-session:
-    runs-on: ubuntu-latest
-    env:
-      PROVIDER: tmdb
-      AUTH_SECRET: "ci-only-secret-ci-only-secret-00000000"
-      APP_PUBLIC_URL: "http://127.0.0.1:3101"
-      USE_SECURE_COOKIES: "false"
-      DATABASE_URL: "file:./ci-session.db"
-      NEXT_TELEMETRY_DISABLED: "1"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-      - run: npm install --no-save playwright
-      - run: npx playwright install --with-deps chromium
-      # session.mjs reads the durable match count with the sqlite3 CLI; do not weaken that to a
-      # route the app serves, which is what the check exists to avoid trusting.
-      - run: sudo apt-get update && sudo apt-get install -y sqlite3
-      - run: npm run db:migrate
-      - name: Start the app
+      # Second server on its own port and database: session.mjs needs a match count it can
+      # read out of SQLite, which the fixture db of the first suite must not carry.
+      - name: Stop the first server
+        run: kill "$(cat /tmp/app-3100.pid)" 2>/dev/null || pkill -f "next start -p 3100" || true
+      - name: Migrate the session database
+        run: npm run db:migrate
+        env:
+          DATABASE_URL: "file:./ci-session.db"
+      - name: Start the app (session database)
         run: |
           npx next start -p 3101 &
           for i in $(seq 1 90); do
@@ -121,6 +114,9 @@ jobs:
             sleep 1
           done
           echo "the app never answered /api/health"; exit 1
+        env:
+          APP_PUBLIC_URL: "http://127.0.0.1:3101"
+          DATABASE_URL: "file:./ci-session.db"
       - run: node e2e/session.mjs
         env:
           E2E_SESSION_BASE_URL: "http://127.0.0.1:3101"
@@ -128,7 +124,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: e2e-session-shots
+          name: e2e-shots
           path: e2e/shots
           retention-days: 7
           if-no-files-found: ignore
